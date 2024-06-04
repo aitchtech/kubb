@@ -2,6 +2,7 @@ import transformers from '@kubb/core/transformers'
 import { FunctionParams, URLPath } from '@kubb/core/utils'
 import { Parser, File, Function, useApp } from '@kubb/react'
 import { pluginTsName } from '@kubb/swagger-ts'
+import { pluginZodName } from '@kubb/swagger-zod'
 import { useOperation, useOperationManager } from '@kubb/plugin-oas/hooks'
 import { getASTParams, getComments } from '@kubb/plugin-oas/utils'
 
@@ -48,9 +49,11 @@ type TemplateProps = {
     path: URLPath
   }
   dataReturnType: NonNullable<PluginSwr['options']['dataReturnType']>
+  requestModelName?: string
+  zodRequestName?: string
 }
 
-function Template({ name, generics, returnType, params, JSDoc, client, hook, dataReturnType }: TemplateProps): ReactNode {
+function Template({ name, generics, returnType, params, JSDoc, client, hook, dataReturnType, requestModelName, zodRequestName }: TemplateProps): ReactNode {
   const clientOptions = [
     `method: "${client.method}"`,
     'url',
@@ -61,48 +64,81 @@ function Template({ name, generics, returnType, params, JSDoc, client, hook, dat
   ].filter(Boolean)
 
   const resolvedClientOptions = `${transformers.createIndent(4)}${clientOptions.join(`,\n${transformers.createIndent(4)}`)}`
-  if (client.withQueryParams) {
-    return (
-      <Function export name={name} generics={generics} returnType={returnType} params={params} JSDoc={JSDoc}>
+  
+  const mainFunction = client.withQueryParams
+      ? <Function export name={name} generics={generics} returnType={returnType} params={params} JSDoc={JSDoc}>
         {`
-         const { mutation: mutationOptions, client: clientOptions = {}, shouldFetch = true } = options ?? {}
+        const { mutation: mutationOptions, client: clientOptions = {}, shouldFetch = true } = options ?? {}
+        const url = ${client.path.template} as const
 
-         const url = ${client.path.template} as const
-         return ${hook.name}<${hook.generics}>(
+        return ${hook.name}<${hook.generics}>(
           shouldFetch ? [url, params]: null,
           async (_url${client.withData ? ', { arg: data }' : ''}) => {
             const res = await client<${client.generics}>({
               ${resolvedClientOptions}
-            })
+            });
 
-            return ${dataReturnType === 'data' ? 'res.data' : 'res'}
+            return ${dataReturnType === 'data' ? 'res.data' : 'res'};
           },
           mutationOptions
-        )
-      `}
+        );
+        `}
       </Function>
-    )
-  }
-  return (
-    <Function export name={name} generics={generics} returnType={returnType} params={params} JSDoc={JSDoc}>
-      {`
-       const { mutation: mutationOptions, client: clientOptions = {}, shouldFetch = true } = options ?? {}
+      : <Function export name={name} generics={generics} returnType={returnType} params={params} JSDoc={JSDoc}>
+        {`
+        const { mutation: mutationOptions, client: clientOptions = {}, shouldFetch = true } = options ?? {}
+        const url = ${client.path.template} as const
 
-       const url = ${client.path.template} as const
-       return ${hook.name}<${hook.generics}>(
-        shouldFetch ? url : null,
-        async (_url${client.withData ? ', { arg: data }' : ''}) => {
-          const res = await client<${client.generics}>({
-            ${resolvedClientOptions}
-          })
+        return ${hook.name}<${hook.generics}>(
+          shouldFetch ? url : null,
+          async (_url${client.withData ? ', { arg: data }' : ''}) => {
+            const res = await client<${client.generics}>({
+              ${resolvedClientOptions}
+            });
 
-          return ${dataReturnType === 'data' ? 'res.data' : 'res'}
+          return ${dataReturnType === 'data' ? 'res.data' : 'res'};
         },
         mutationOptions
-      )
+      );
+      `}
+      </Function>;
+  
+  const formFunctionName = 'useForm' + name.substring(3);
+  const formFunctionParams = `...args: Parameters<typeof ${name}>`;
+  const formFunctionReturnType = `{
+    mutation: ReturnType<typeof ${name}>;
+    form: UseFormReturn<${requestModelName}>;
+    submitToMutation: ReturnType<UseFormHandleSubmit<${requestModelName}>>
+  }`
+
+  return <>
+    {mainFunction}
+
+    {zodRequestName && <Function export name={formFunctionName} generics={generics} returnType={formFunctionReturnType} params={formFunctionParams} JSDoc={JSDoc}>
+    {`
+          const mutation = ${name}(...args);
+
+          function onSubmit(formValue: ${requestModelName}) {
+              mutation.trigger(formValue);
+          }
+      
+          const form = useForm<${requestModelName}>({
+              resolver: zodResolver(${zodRequestName})
+          });
+      
+          const submitToMutation = form.handleSubmit(onSubmit);
+
+          // Add backend validation error processing here. Should be added as field errors in form
+      
+          return {
+              mutation,
+              form,
+              submitToMutation
+          };
+
     `}
-    </Function>
-  )
+    </Function>}
+  </>
 }
 
 const defaultTemplates = {
@@ -121,6 +157,7 @@ type Props = {
 
 export function Mutation({ factory, Template = defaultTemplates.default }: Props): ReactNode {
   const {
+    pluginManager,
     plugin: {
       options: { dataReturnType },
     },
@@ -131,18 +168,27 @@ export function Mutation({ factory, Template = defaultTemplates.default }: Props
   const name = getName(operation, { type: 'function' })
   const schemas = getSchemas(operation)
 
+  const requestModelName = schemas.request?.name ? `${factory.name}["request"]` : ''
+  const zodRequestName = schemas.request && pluginManager.resolveName({
+    name: schemas.request!.name,
+    pluginKey: [pluginZodName],
+    type: 'function',
+  });
+
   const params = new FunctionParams()
   const client = {
     method: operation.method,
     path: new URLPath(operation.path),
-    generics: [`${factory.name}["data"]`, `${factory.name}["error"]`, schemas.request?.name ? `${factory.name}["request"]` : ''].filter(Boolean).join(', '),
+    generics: [`${factory.name}["data"]`, `${factory.name}["error"]`, requestModelName].filter(Boolean).join(', '),
     withQueryParams: !!schemas.queryParams?.name,
     withData: !!schemas.request?.name,
     withPathParams: !!schemas.pathParams?.name,
     withHeaders: !!schemas.headerParams?.name,
   }
 
-  const resultGenerics = [`${factory.name}["response"]`, `${factory.name}["error"]`]
+  const keyType = client.withQueryParams ? '[typeof url, typeof params] | null' : 'typeof url | null'
+
+  const resultGenerics = [`${factory.name}["response"]`, `${factory.name}["error"], ${keyType}, ${requestModelName}`]
 
   params.add([
     ...getASTParams(schemas.pathParams, { typed: true }),
@@ -172,7 +218,7 @@ export function Mutation({ factory, Template = defaultTemplates.default }: Props
 
   const hook = {
     name: 'useSWRMutation',
-    generics: [...resultGenerics, client.withQueryParams ? '[typeof url, typeof params] | null' : 'typeof url | null'].join(', '),
+    generics: [...resultGenerics].join(', '),
   }
 
   return (
@@ -184,6 +230,8 @@ export function Mutation({ factory, Template = defaultTemplates.default }: Props
       params={params.toString()}
       returnType={`SWRMutationResponse<${resultGenerics.join(', ')}>`}
       dataReturnType={dataReturnType}
+      requestModelName={requestModelName}
+      zodRequestName={zodRequestName}
     />
   )
 }
@@ -197,6 +245,7 @@ type FileProps = {
 
 Mutation.File = function ({ templates = defaultTemplates }: FileProps): ReactNode {
   const {
+    pluginManager,
     plugin: {
       options: {
         client: { importPath },
@@ -210,6 +259,15 @@ Mutation.File = function ({ templates = defaultTemplates }: FileProps): ReactNod
   const schemas = getSchemas(operation)
   const file = getFile(operation)
   const fileType = getFile(operation, { pluginKey: [pluginTsName] })
+  const fileZodSchemas = getFile(operation, {
+    pluginKey: [pluginZodName],
+  });
+  const zodRequestName = schemas.request && pluginManager.resolveName({
+    name: schemas.request!.name,
+    pluginKey: [pluginZodName],
+    type: 'function',
+  });
+
   const factoryName = getName(operation, { type: 'type' })
 
   const Template = templates.default
@@ -220,6 +278,11 @@ Mutation.File = function ({ templates = defaultTemplates }: FileProps): ReactNod
   return (
     <Parser language="typescript">
       <File<FileMeta> baseName={file.baseName} path={file.path} meta={file.meta}>
+        {zodRequestName && <>
+          <File.Import name={[zodRequestName]} root={file.path} path={fileZodSchemas.path} />
+          <File.Import name={["zodResolver"]} path="@hookform/resolvers/zod" />
+          <File.Import name={['UseFormHandleSubmit', 'UseFormReturn', 'useForm']} path="react-hook-form" />
+        </>}
         <File.Import name="useSWRMutation" path="swr/mutation" />
         <File.Import name={['SWRMutationConfiguration', 'SWRMutationResponse']} path="swr/mutation" isTypeOnly />
         <File.Import name={'client'} path={importPath} />
